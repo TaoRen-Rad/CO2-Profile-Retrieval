@@ -1,0 +1,24 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Training outputs and local data
+status/
+data/
+*.pth
+*.pt
+*.ckpt
+*.parquet
+
+# Plots and logs generated during local runs
+*.log
+*.png
+*.pdf

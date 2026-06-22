@@ -1,0 +1,1 @@
+RAND_SEED = 42
