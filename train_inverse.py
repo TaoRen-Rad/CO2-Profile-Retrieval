@@ -15,6 +15,7 @@ from oco2_surrogate.load_data import load_retrieved_data
 from oco2_surrogate.plot import plot_co2_profiles_with_uncertainty_raw, plot_xco2_scatter_raw
 from oco2_surrogate.preprocessor import StandardScaler
 from oco2_surrogate.model import MLP
+from oco2_surrogate.release import load_smoke_inverse_dfs
 
 
 TRAIN_YYMMS = [f"{yy}{mm:02d}" for yy in range(17, 20) for mm in range(1, 13)]
@@ -97,6 +98,11 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--sample_new", action="store_true", help="Regenerate integrated dataframes with augmentation")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--smoke_test", action="store_true", help="Use tiny synthetic fixture data and CPU-safe defaults")
+    parser.add_argument("--epochs", type=int, default=None, help="Override the number of training epochs")
+    parser.add_argument("--max_rows", type=int, default=None, help="Limit rows loaded in smoke-test mode")
+    parser.add_argument("--no_aim", action="store_true", help="Disable Aim logging")
+    parser.add_argument("--output_dir", type=str, default=None, help="Directory for checkpoints and plots")
     return parser.parse_args()
 
 
@@ -122,7 +128,7 @@ def normalize_apriori_name(name: str) -> str:
 
 
 def tensor_from_df(df, dtype):
-    return torch.from_numpy(df.values).to(dtype)
+    return torch.from_numpy(df.to_numpy(copy=True)).to(dtype)
 
 
 def dataframe_from_tensor(tensor: torch.Tensor, columns: List[str]):
@@ -503,14 +509,31 @@ def evaluate(model, loader, criterion_retr, criterion_wf, criterion_xco2,
 def main():
     args = parse_args()
     base_name = __file__.split('/')[-1].split('.')[0]
-    status_dir = f'status/{base_name}'
+    status_dir = args.output_dir or f'status/{base_name}'
     os.makedirs(status_dir, exist_ok=True)
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    requested_device = "cpu" if args.smoke_test and args.device == "cuda" else args.device
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        requested_device = "cpu"
+    device = torch.device(requested_device)
     dtype = torch.float32
 
     torch.manual_seed(RAND_SEED)
 
-    if args.sample_new:
+    if args.smoke_test:
+        print("Loading synthetic smoke-test data...")
+        train_dfs, test_dfs = load_smoke_inverse_dfs(max_rows=args.max_rows)
+        df_geo_train = train_dfs["df_geo_train"]
+        df_retr_train = train_dfs["df_retr_train"]
+        df_apriori_train = train_dfs["df_apriori_train"]
+        df_wf_train = train_dfs["df_wf_train"]
+        df_rad_train = train_dfs["df_rad_train"]
+
+        df_geo_test = test_dfs["df_geo_test"]
+        df_retr_test = test_dfs["df_retr_test"]
+        df_apriori_test = test_dfs["df_apriori_test"]
+        df_wf_test = test_dfs["df_wf_test"]
+        df_rad_test = test_dfs["df_rad_test"]
+    elif args.sample_new:
         print("Loading and processing new data...")
         train_rows = load_retrieved_data(
             TRAIN_YYMMS,
@@ -690,8 +713,13 @@ def main():
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=min(args.batch_size, len(train_dataset)) if args.smoke_test else args.batch_size,
+        shuffle=True,
+        num_workers=0 if args.smoke_test else 4,
+        pin_memory=False if args.smoke_test else True,
+    )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
     # Prepare test tensors (without augmentation)
@@ -728,7 +756,7 @@ def main():
         co2_indices=co2_indices,
         pressure_indices=pressure_indices,
         h2o_indices=h2o_indices,
-        hidden_dim=1024,
+        hidden_dim=64 if args.smoke_test else 1024,
         co2_mean=retrieved_scaler.mean_[co2_indices],
         co2_scale=retrieved_scaler.scale_[co2_indices],
         wf_mean=wf_scaler.mean_,
@@ -738,10 +766,10 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
     # Learning rate scheduler - Cosine Annealing with Warm Restarts
-    T_0_epochs = 20  # Initial restart period in epochs
+    T_0_epochs = 1 if args.smoke_test else 20  # Initial restart period in epochs
     T_mult = 1  # Multiplication factor for restart period
     eta_min = 1e-6  # Minimum learning rate
-    n_cycles = 15
+    n_cycles = 1 if args.smoke_test else 15
     steps_per_epoch = len(train_loader)
     T_0_steps = T_0_epochs * steps_per_epoch
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -750,6 +778,8 @@ def main():
     
     geometric_series_sum = lambda a0, r, n: int(a0 * (1 - r**n) / (1 - r) if r != 1 else a0 * n)
     n_epochs = geometric_series_sum(T_0_epochs, T_mult, n_cycles)
+    if args.epochs is not None:
+        n_epochs = args.epochs
     cycle_final_epochs = [1]+ [geometric_series_sum(T_0_epochs, T_mult, i) for i in range(1, n_cycles + 1)]
     
     # Create retrieval weight tensor
@@ -769,14 +799,17 @@ def main():
     xco2_weight = torch.ones(1, device=device, dtype=dtype)
     criterion_xco2 = GaussianNLLLoss(xco2_weight)
 
-    run = Run(repo=".", experiment=base_name)
+    run = None
+    if not args.no_aim:
+        run = Run(repo=".", experiment=base_name)
     hparams = vars(args).copy()
     hparams.update({
         'T_0_epochs': T_0_epochs,
         'T_mult': T_mult,
         'eta_min': eta_min,
     })
-    run["hparams"] = hparams
+    if run is not None:
+        run["hparams"] = hparams
 
     best_val_loss = float("inf")
     best_test_loss = float("inf")
@@ -815,13 +848,14 @@ def main():
             return_preds=True
         )
         
-        run.track(train_loss, name="loss", step=epoch, context={"subset": "train"})
-        run.track(val_loss, name="loss", step=epoch, context={"subset": "val"})
-        run.track(test_loss, name="loss", step=epoch, context={"subset": "test"})
+        if run is not None:
+            run.track(train_loss, name="loss", step=epoch, context={"subset": "train"})
+            run.track(val_loss, name="loss", step=epoch, context={"subset": "val"})
+            run.track(test_loss, name="loss", step=epoch, context={"subset": "test"})
 
         if (epoch + 1) in cycle_final_epochs:
             torch.save(model.state_dict(), os.path.join(status_dir, f"{epoch:04d}.pth"))
-            plot_data = [(val_preds, val_targets), (test_preds, test_targets)]
+            plot_data = [] if args.smoke_test else [(val_preds, val_targets), (test_preds, test_targets)]
             plot_names = ["val", "test"]
             for (preds, targets), name in zip(plot_data, plot_names):
                 retr_pred_batches = torch.cat([p[0] for p in preds], dim=0)
@@ -873,9 +907,10 @@ def main():
         os.path.join(status_dir, "scalers.pth"),
     )
 
-    run.track(best_val_loss, name="best_val_loss", step=n_epochs - 1)
-    run.track(best_test_loss, name="best_test_loss", step=n_epochs - 1)
-    run.close()
+    if run is not None:
+        run.track(best_val_loss, name="best_val_loss", step=n_epochs - 1)
+        run.track(best_test_loss, name="best_test_loss", step=n_epochs - 1)
+        run.close()
 
 
 if __name__ == "__main__":

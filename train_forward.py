@@ -31,6 +31,7 @@ from oco2_surrogate.model import MLPOutputMasked
 from oco2_surrogate import RAND_SEED
 from oco2_surrogate.plot import forward_plot
 from oco2_surrogate.absc import AbsorptionCoefficientModule, sh2vmr, vmr2sh
+from oco2_surrogate.release import make_forward_smoke_datasets
 # from LOSTorch.predict import predict as torch_los_predict
 
 NCOLS = 120
@@ -383,6 +384,18 @@ def parse_args():
                        help='Whether to run a dry run')
     parser.add_argument('--sample_new', action='store_true', default=False,
                        help='Whether to run a dry run')
+    parser.add_argument('--smoke_test', action='store_true',
+                       help='Use tiny synthetic fixture data and CPU-safe training defaults.')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Override the number of training epochs.')
+    parser.add_argument('--max_rows', type=int, default=None,
+                       help='Limit rows loaded in smoke-test mode.')
+    parser.add_argument('--no_aim', action='store_true',
+                       help='Disable Aim logging.')
+    parser.add_argument('--output_dir', type=str, default=None,
+                       help='Directory for checkpoints and plots.')
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device to use, e.g. cpu or cuda.')
     return parser.parse_args()
 
 
@@ -403,7 +416,10 @@ if __name__ == "__main__":
     bandidx = band2bandidx[band]
     # Setup
     plt.rcParams.update({"figure.dpi": 120})
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    requested_device = args.device or ("cpu" if args.smoke_test else "cuda")
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        requested_device = "cpu"
+    device = torch.device(requested_device)
     dtype = torch.float32
     print(f"Using device: {device}")
     print(f"Using dtype: {dtype}")
@@ -411,12 +427,27 @@ if __name__ == "__main__":
     
     # Create output directory with band name
     base_name = __file__.split('/')[-1].split('.')[0] + f"_{band}"
-    status_dir = f'status/{base_name}'
+    status_dir = args.output_dir or f'status/{base_name}'
     data_dir = "status/train_forward_o2"
     os.makedirs(status_dir, exist_ok=True)
     
     # Load training data (2017-2020)
-    if sample_new:
+    if args.smoke_test:
+        full_train_dataset, test_dataset, indices, scalers, df_retrieved_columns = make_forward_smoke_datasets(
+            max_rows=args.max_rows,
+            dtype=dtype,
+        )
+        scaler_states = {
+            "geometry": scalers["geometry"].state_dict(),
+            "retrieved": scalers["retrieved"].state_dict(),
+            "radiance": scalers["radiance"].state_dict()
+        }
+        torch.save(full_train_dataset, f"{status_dir}/full_train_dataset.pth")
+        torch.save(test_dataset, f"{status_dir}/test_dataset.pth")
+        torch.save(indices, f"{status_dir}/indices.pth")
+        torch.save(scaler_states, f"{status_dir}/scalers.pth")
+        torch.save(df_retrieved_columns, f"{status_dir}/df_retrieved_columns.pth")
+    elif sample_new:
         full_train_dataset, test_dataset, indices, scalers, df_retrieved_columns = training_data(fraction, dtype)
         torch.save(full_train_dataset, f"{status_dir}/full_train_dataset.pth")
         torch.save(test_dataset, f"{status_dir}/test_dataset.pth")
@@ -533,7 +564,10 @@ if __name__ == "__main__":
     
     not_nan_number = len(nnan_indices)
     # hidden_dims = [(geo_dim + ret_dim)//2] + [not_nan_number] * 4 + [not_nan_number//5]
-    hidden_dims = [(geo_dim + ret_dim)//2] + [not_nan_number] * 4 + [not_nan_number//5]
+    if args.smoke_test:
+        hidden_dims = [32, 32]
+    else:
+        hidden_dims = [(geo_dim + ret_dim)//2] + [not_nan_number] * 4 + [not_nan_number//5]
     # hidden_dims = [not_nan_number] * 4 + [not_nan_number//5]
     dropout_rate = 0.0
     n_components = 50
@@ -565,7 +599,7 @@ if __name__ == "__main__":
     with open(f"{status_dir}/model_config.pkl", "wb") as f:
         pickle.dump(model_config, f)
     
-    batch_size = 1024
+    batch_size = 8 if args.smoke_test else 1024
     # dataloader_kwargs = {
     #     "batch_size": batch_size,
     #     "shuffle": True,
@@ -592,7 +626,7 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=weight_decay)
     
     # Learning rate scheduler - Cosine Annealing with Warm Restarts
-    T_0_epochs = 25  # Initial restart period in epochs
+    T_0_epochs = 1 if args.smoke_test else 25  # Initial restart period in epochs
     T_mult = 1  # Multiplication factor for restart period (must be integer >= 1)
     eta_min = 1e-7  # Minimum learning rate
     
@@ -605,40 +639,45 @@ if __name__ == "__main__":
     )
     
     geometric_series_sum = lambda a0, r, n: int(a0 * (1 - r**n) / (1 - r) if r != 1 else a0 * n)
-    n_cycles = 10
+    n_cycles = 1 if args.smoke_test else 10
     n_epochs = geometric_series_sum(T_0_epochs, T_mult, n_cycles)
+    if args.epochs is not None:
+        n_epochs = args.epochs
     
     # Initialize Aim run
-    run = Run(
-        repo='.',  # Current directory as aim repo
-        experiment=base_name
-    )
+    run = None
+    if not args.no_aim:
+        run = Run(
+            repo='.',  # Current directory as aim repo
+            experiment=base_name
+        )
     
     max_norm = 0.5  # Reduced from 1.0 for better stability
     
     # Log hyperparameters
-    run['hparams'] = {
-        'band': band,
-        'fraction': fraction,
-        'batch_size': batch_size,
-        'hidden_dims': hidden_dims,
-        'dropout_rate': dropout_rate,
-        'learning_rate': 1e-3,
-        'weight_decay': weight_decay,
-        'T_0_epochs': T_0_epochs,
-        'T_mult': T_mult,
-        'eta_min': eta_min,
-        'n_cycles': n_cycles,
-        'n_epochs': n_epochs,
-        'geo_dim': geo_dim,
-        'ret_dim': ret_dim,
-        'rad_dim': rad_dim,
-        'num_band_indices': len(band_indices),
-        'num_nnan_indices': len(nnan_indices),
-        'device': str(device),
-        'dtype': str(dtype),
-        'max_norm': max_norm
-    }
+    if run is not None:
+        run['hparams'] = {
+            'band': band,
+            'fraction': fraction,
+            'batch_size': batch_size,
+            'hidden_dims': hidden_dims,
+            'dropout_rate': dropout_rate,
+            'learning_rate': 1e-3,
+            'weight_decay': weight_decay,
+            'T_0_epochs': T_0_epochs,
+            'T_mult': T_mult,
+            'eta_min': eta_min,
+            'n_cycles': n_cycles,
+            'n_epochs': n_epochs,
+            'geo_dim': geo_dim,
+            'ret_dim': ret_dim,
+            'rad_dim': rad_dim,
+            'num_band_indices': len(band_indices),
+            'num_nnan_indices': len(nnan_indices),
+            'device': str(device),
+            'dtype': str(dtype),
+            'max_norm': max_norm
+        }
     
     # Collect tau features from training data to compute statistics
     model.eval()
@@ -656,7 +695,8 @@ if __name__ == "__main__":
     print("Running dry run evaluation...")
     dry_loss, dry_predictions, dry_targets = evaluate_model(model, test_loader, criterion, device, 0, return_predictions=True, aim_run=run, subset='test', dtype=dtype)
     dry_predictions, dry_targets = band_inverse(dry_predictions, dry_targets, scalers["radiance"])
-    forward_plot(dry_predictions, dry_targets, status_dir, "dry_run")
+    if not args.smoke_test:
+        forward_plot(dry_predictions, dry_targets, status_dir, "dry_run")
     print("Dry run done")
     
     if dry_run:
@@ -681,7 +721,8 @@ if __name__ == "__main__":
         if epoch in check_epochs:
             test_loss, test_predictions, test_targets = evaluate_model(model, test_loader, criterion, device, epoch, return_predictions=True, aim_run=run, subset='test', dtype=dtype)
             test_predictions, test_targets = band_inverse(test_predictions, test_targets, scalers["radiance"])
-            forward_plot(test_predictions, test_targets, status_dir, f"check_{epoch}")
+            if not args.smoke_test:
+                forward_plot(test_predictions, test_targets, status_dir, f"check_{epoch}")
             torch.save(model.state_dict(), f'{status_dir}/mlp_model_{epoch}.pth')
         else:
             test_loss = evaluate_model(model, test_loader, criterion, device, epoch, aim_run=run, subset='test', dtype=dtype)
@@ -715,15 +756,17 @@ if __name__ == "__main__":
     
     final_test_loss, final_test_predictions, final_test_targets = evaluate_model(model, test_loader, criterion, device, epoch, return_predictions=True, aim_run=run, subset='final_test', dtype=dtype)
     final_test_predictions, final_test_targets = band_inverse(final_test_predictions, final_test_targets, scalers["radiance"])
-    forward_plot(final_test_predictions, final_test_targets, status_dir, "final_test")
+    if not args.smoke_test:
+        forward_plot(final_test_predictions, final_test_targets, status_dir, "final_test")
     
     # Log final metrics to Aim
-    run.track(min_val_loss, name='best_val_loss', step=n_epochs-1)
-    run.track(min_test_loss, name='best_test_loss', step=n_epochs-1)
-    run.track(final_test_loss, name='final_test_loss', step=n_epochs-1)
+    if run is not None:
+        run.track(min_val_loss, name='best_val_loss', step=n_epochs-1)
+        run.track(min_test_loss, name='best_test_loss', step=n_epochs-1)
+        run.track(final_test_loss, name='final_test_loss', step=n_epochs-1)
     
     # Close the Aim run
-    run.close()
+        run.close()
     
     
     

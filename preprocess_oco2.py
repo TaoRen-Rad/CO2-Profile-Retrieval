@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from los_physics.constant import sh2vmr
 from los_physics.predict import predict as predict_los
+from oco2_surrogate.release import load_smoke_dataframes
 
 
 BAND_NAMES = ["o2", "weak_co2", "strong_co2"]
@@ -73,6 +74,11 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Overwrite existing component parquet files.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Write tiny synthetic non-LOS parquet outputs instead of reading L2DiaND files.",
     )
     return parser.parse_args()
 
@@ -442,6 +448,47 @@ def export_month(
 
 def main() -> None:
     args = parse_args()
+    if args.smoke_test:
+        if "los" in args.components:
+            raise SystemExit("--smoke-test supports non-LOS components only; omit los.")
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        frames = load_smoke_dataframes()
+        for month in args.months:
+            yymm = normalize_yymm(month)
+            component_frames = {
+                "screen": pd.DataFrame(
+                    {
+                        "latitude": np.linspace(30.0, 31.0, len(frames["geo"])),
+                        "longitude": np.linspace(120.0, 121.0, len(frames["geo"])),
+                    },
+                    index=frames["geo"].index,
+                ),
+                "geometry": frames["geo"],
+                "state": pd.concat(
+                    [
+                        frames["retr"],
+                        frames["apriori"],
+                        frames["wf"],
+                        pd.Series(1, index=frames["geo"].index, name="outcome_flag"),
+                    ],
+                    axis=1,
+                ),
+                "measured": frames["rad"],
+                "modeled": frames["rad"],
+                "wavelength": frames["rad"] * 0.0,
+                "signal": pd.DataFrame(
+                    {f"signal_{band}": 1.0 for band in BAND_NAMES},
+                    index=frames["geo"].index,
+                ),
+            }
+            for component in args.components:
+                out = output_dir / f"df_{component}_{yymm}.parquet"
+                if out.exists() and not args.overwrite:
+                    continue
+                component_frames[component].to_parquet(out)
+                print(f"Saved smoke {component}: {out}")
+        return
     months = [normalize_yymm(month) for month in args.months]
     for yymm in months:
         export_month(
@@ -457,4 +504,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

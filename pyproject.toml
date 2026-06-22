@@ -1,0 +1,22 @@
+[project]
+name = "co2-profile-retrieval"
+version = "0.1.0"
+description = "Release-ready OCO-2 CO2 profile retrieval training and inference code."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aim",
+    "h5py",
+    "matplotlib",
+    "numba",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scikit-learn",
+    "scipy",
+    "torch",
+    "tqdm",
+]
+
+[tool.uv]
+package = false

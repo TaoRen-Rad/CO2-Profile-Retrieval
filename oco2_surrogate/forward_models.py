@@ -1,4 +1,5 @@
 import pickle
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
@@ -18,16 +19,24 @@ def load_forward_model(
     device: str = "cuda",
     checkpoint: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
-    base_path = f"status/{base_name}_{band}"
-    data_path = data_dir
+    root = Path(data_dir)
+    if (root / band / "model_config.pkl").exists():
+        base_path = root / band
+        data_path = root
+    elif (root / "forward" / band / "model_config.pkl").exists():
+        base_path = root / "forward" / band
+        data_path = root / "forward"
+    else:
+        base_path = Path("status") / f"{base_name}_{band}"
+        data_path = root
 
-    scalers_path = f"{data_path}/scalers.pth"
+    scalers_path = data_path / "scalers.pth"
     scalers = load_scalers(scalers_path)
     geometry_scaler = scalers["geometry"]
     retrieved_scaler = scalers["retrieved"]
     radiance_scaler = scalers["radiance"]
 
-    indices_path = f"{data_path}/indices.pth"
+    indices_path = data_path / "indices.pth"
     indices = torch.load(indices_path, map_location="cpu")
     band_indices = indices["all_state_indices"][band]
     nnan_indices = indices["all_nnan_indices"][band]
@@ -37,7 +46,7 @@ def load_forward_model(
     radiance_scaler_sliced_mean = radiance_scaler.mean_[rad_indices]
     radiance_scaler_sliced_scale = radiance_scaler.scale_[rad_indices]
 
-    with open(f"{base_path}/model_config.pkl", "rb") as f:
+    with open(base_path / "model_config.pkl", "rb") as f:
         model_config = pickle.load(f)
 
     model = ForwardModel(**model_config)
@@ -49,9 +58,9 @@ def load_forward_model(
     model.radiance_scaler.register_buffer("scale_", radiance_scaler_sliced_scale)
 
     if checkpoint is not None:
-        model_path = f"{base_path}/mlp_model_{checkpoint}.pth"
+        model_path = base_path / f"mlp_model_{checkpoint}.pth"
     else:
-        model_path = f"{base_path}/mlp_model_best.pth"
+        model_path = base_path / "mlp_model_best.pth"
 
     model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
     model = model.to(device, dtype=torch.float32)
